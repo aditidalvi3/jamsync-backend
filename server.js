@@ -9,7 +9,7 @@ const axios = require('axios');
 const { Server } = require('socket.io');
 const { URLSearchParams } = require('url');
 
-// --- Room Management Helpers ---\
+// --- Room Management Helpers ---
 const {
   addUserToRoom,
   removeUserFromRoom,
@@ -21,8 +21,19 @@ const app = express();
 const server = http.createServer(app);
 
 // --- CORS & JSON Middleware ---
+const allowedOrigins = [
+  'http://localhost:3000',                       // Local
+  process.env.FRONTEND_URL                       // Vercel frontend
+];
+
 app.use(cors({
-  origin: ['http://localhost:3000', process.env.REACT_APP_FRONTEND_URL],
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS: ' + origin));
+    }
+  },
   credentials: true,
 }));
 app.use(express.json());
@@ -30,14 +41,15 @@ app.use(express.json());
 // --- Socket.IO Setup ---
 const io = new Server(server, {
   cors: {
-    origin: ['http://localhost:3000', process.env.REACT_APP_FRONTEND_URL],
+    origin: allowedOrigins,
     methods: ['GET', 'POST'],
+    credentials: true,
   },
 });
 
 // --- Routes ---
 
-// 🔒 Step 1: Redirect user to Spotify Authorization
+// 🔒 Redirect user to Spotify Authorization
 app.get('/login', (req, res) => {
   const scopes = [
     'user-read-private',
@@ -46,7 +58,7 @@ app.get('/login', (req, res) => {
     'user-read-playback-state',
     'user-read-currently-playing',
   ];
-  const redirectUri = `${process.env.REACT_APP_BACKEND_URL}/callback`;
+  const redirectUri = `${process.env.BACKEND_URL}/callback`;
 
   res.redirect('https://accounts.spotify.com/authorize?' +
     new URLSearchParams({
@@ -58,15 +70,15 @@ app.get('/login', (req, res) => {
   );
 });
 
-// 🔒 Step 2: Handle the callback from Spotify
+// 🔒 Handle Spotify Callback
 app.get('/callback', async (req, res) => {
   const code = req.query.code || null;
-  const redirectUri = `${process.env.REACT_APP_BACKEND_URL}/callback`;
-  const frontendRedirect = process.env.REACT_APP_FRONTEND_URL;
+  const redirectUri = `${process.env.BACKEND_URL}/callback`;
+  const frontendRedirect = process.env.FRONTEND_URL;
 
   const data = new URLSearchParams({
     grant_type: 'authorization_code',
-    code: code,
+    code,
     redirect_uri: redirectUri,
     client_id: process.env.SPOTIFY_CLIENT_ID,
     client_secret: process.env.SPOTIFY_CLIENT_SECRET,
@@ -74,9 +86,7 @@ app.get('/callback', async (req, res) => {
 
   try {
     const response = await axios.post('https://accounts.spotify.com/api/token', data, {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     });
 
     const { access_token, refresh_token, expires_in } = response.data;
@@ -85,48 +95,42 @@ app.get('/callback', async (req, res) => {
       new URLSearchParams({
         access_token,
         refresh_token,
-        expires_in
+        expires_in,
       }).toString()
     );
   } catch (error) {
-    console.error('Error fetching access token:', error.response ? error.response.data : error.message);
+    console.error('Error fetching access token:', error.response?.data || error.message);
     res.status(500).send('Failed to get access token from Spotify.');
   }
 });
 
-// ✨ ADDED: Route to get user profile from Spotify
+// 👤 Get Spotify Profile
 app.get('/profile', async (req, res) => {
   const accessToken = req.headers.authorization?.split(' ')[1];
-
-  if (!accessToken) {
-    return res.status(401).send('No access token provided.');
-  }
+  if (!accessToken) return res.status(401).send('No access token provided.');
 
   try {
     const { data } = await axios.get('https://api.spotify.com/v1/me', {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-      },
+      headers: { Authorization: `Bearer ${accessToken}` },
     });
     res.json(data);
   } catch (error) {
-    console.error('Error fetching Spotify profile:', error.response ? error.response.data : error.message);
-    res.status(error.response ? error.response.status : 500).send('Failed to fetch Spotify profile.');
+    console.error('Error fetching profile:', error.response?.data || error.message);
+    res.status(error.response?.status || 500).send('Failed to fetch Spotify profile.');
   }
 });
 
+// 🎵 Get Currently Playing Track
 app.post('/update-now-playing', async (req, res) => {
   const { accessToken, roomId } = req.body;
-  
+
   if (!accessToken || !roomId) {
     return res.status(400).send('Missing access token or room ID.');
   }
-  
+
   try {
-    const response = await axios.get('api.spotify.com', {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-      },
+    const response = await axios.get('https://api.spotify.com/v1/me/player/currently-playing', {
+      headers: { Authorization: `Bearer ${accessToken}` },
     });
 
     if (response.status === 204) {
@@ -135,10 +139,10 @@ app.post('/update-now-playing', async (req, res) => {
     }
 
     const trackData = response.data.item;
-    if (trackData && trackData.type === 'track') {
+    if (trackData?.type === 'track') {
       const track = {
         title: trackData.name,
-        artist: trackData.artists.map(artist => artist.name).join(', '),
+        artist: trackData.artists.map(a => a.name).join(', '),
         albumArt: trackData.album.images[0].url,
       };
       io.in(roomId).emit('now-playing', track);
@@ -148,14 +152,15 @@ app.post('/update-now-playing', async (req, res) => {
       res.status(404).send('No track currently playing.');
     }
   } catch (error) {
-    console.error('Error fetching currently playing track:', error.response ? error.response.data : error.message);
-    res.status(error.response ? error.response.status : 500).send('Failed to fetch currently playing track.');
+    console.error('Now playing error:', error.response?.data || error.message);
+    res.status(error.response?.status || 500).send('Failed to fetch track.');
   }
 });
 
-// 🔄 Route to refresh token
+// 🔄 Refresh Spotify Token
 app.get('/refresh_token', async (req, res) => {
   const refreshToken = req.query.refresh_token;
+
   const data = new URLSearchParams({
     grant_type: 'refresh_token',
     refresh_token: refreshToken,
@@ -165,9 +170,7 @@ app.get('/refresh_token', async (req, res) => {
 
   try {
     const response = await axios.post('https://accounts.spotify.com/api/token', data, {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     });
 
     res.json(response.data);
@@ -176,21 +179,13 @@ app.get('/refresh_token', async (req, res) => {
   }
 });
 
-// --- Start Server ---
-const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-  console.log(`🚀 Server is running on port ${PORT}`);
-});
-
-// --- Socket.io Handlers ---
+// --- WebSocket Handlers ---
 io.on('connection', (socket) => {
-  console.log(`🔌 New connection: ${socket.id}`);
+  console.log(`🔌 Connected: ${socket.id}`);
 
   socket.on('join-room', (roomId, username) => {
     socket.join(roomId);
     addUserToRoom(roomId, socket.id);
-    console.log(`👤 ${username || socket.id} joined room ${roomId}`);
-
     socket.to(roomId).emit('user-joined', username || socket.id);
     io.in(roomId).emit('room-users', getUsersInRoom(roomId));
   });
@@ -203,16 +198,21 @@ io.on('connection', (socket) => {
     });
   });
 
-  // WebRTC Signaling
   socket.on('offer', (data) => socket.to(data.roomId).emit('offer', data));
   socket.on('answer', (data) => socket.to(data.roomId).emit('answer', data));
   socket.on('ice-candidate', (data) => socket.to(data.roomId).emit('ice-candidate', data));
 
   socket.on('disconnecting', () => {
     const rooms = [...socket.rooms].filter((r) => r !== socket.id);
-    rooms.forEach((roomId) => {
+    rooms.forEach(roomId => {
       removeUserFromRoom(roomId, socket.id);
       socket.to(roomId).emit('user-left', socket.id);
     });
   });
+});
+
+// --- Start Server ---
+const PORT = process.env.PORT || 3001;
+server.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
 });
